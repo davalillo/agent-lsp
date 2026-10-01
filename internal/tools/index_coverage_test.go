@@ -3,7 +3,6 @@ package tools
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -95,7 +94,7 @@ func TestHasUnopenedFiles_Recursive(t *testing.T) {
 func TestHasUnopenedFiles_BoundedByCap(t *testing.T) {
 	root := t.TempDir()
 	for i := 0; i < maxUnopenedProbeFiles+50; i++ {
-		name := filepath.Join(root, strings.Repeat("f", 1)+string(rune('a'+i%26))+itoa(i)+".go")
+		name := filepath.Join(root, "f"+itoa(i)+".go")
 		if err := os.WriteFile(name, []byte("x"), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -106,16 +105,4 @@ func TestHasUnopenedFiles_BoundedByCap(t *testing.T) {
 	if !hasUnopenedFiles(root, 0) {
 		t.Fatal("large workspace with nothing opened must report unopened files")
 	}
-}
-
-func itoa(i int) string {
-	if i == 0 {
-		return "0"
-	}
-	var b []byte
-	for i > 0 {
-		b = append([]byte{byte('0' + i%10)}, b...)
-		i /= 10
-	}
-	return string(b)
 }
