@@ -942,6 +942,16 @@ func (c *LSPClient) RootDir() string {
 	return c.rootDir
 }
 
+// OpenDocumentCount returns how many documents the client currently holds
+// open (didOpen'ed in this session). Exported so tool handlers can compare
+// the opened set against the workspace contents when qualifying empty
+// results — some servers only index opened documents. (issue #42)
+func (c *LSPClient) OpenDocumentCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.openDocs)
+}
+
 // IsInitialized reports whether the LSP handshake has completed successfully.
 // A non-nil client is not necessarily initialized — NewLSPClient creates a
 // client object but Initialize must be called to start the process and complete
@@ -1392,7 +1402,19 @@ func (c *LSPClient) RefCache() *SymbolRefCache {
 }
 
 // Restart shuts down the current server and reinitializes it.
-func (c *LSPClient) Restart(ctx context.Context, rootDir string) error {
+func (c *LSPClient) Restart(ctx context.Context, rootDir string) (int, error) {
+	// Snapshot the documents open in the outgoing session so the fresh server
+	// can be brought back to the same state. Some servers (mql-lsp-server)
+	// drive their workspace symbol index from opened documents only — without
+	// the replay, workspace queries return empty until a document is reopened
+	// by hand. (issue #3B)
+	c.mu.Lock()
+	snapshot := make([]docMeta, 0, len(c.openDocs))
+	for _, meta := range c.openDocs {
+		snapshot = append(snapshot, meta)
+	}
+	c.mu.Unlock()
+
 	// Try graceful shutdown; ignore errors since we restart anyway.
 	_ = c.Shutdown(ctx)
 
@@ -1423,7 +1445,47 @@ func (c *LSPClient) Restart(ctx context.Context, rootDir string) error {
 	c.legendModifiers = nil
 	c.legendMu.Unlock()
 
-	return c.Initialize(ctx, rootDir)
+	if err := c.Initialize(ctx, rootDir); err != nil {
+		return 0, err
+	}
+	return c.replayOpenDocuments(ctx, snapshot, rootDir), nil
+}
+
+// replayOpenDocuments re-opens the documents that were open in the previous
+// session on the freshly started server. File contents are re-read from disk
+// (the server must receive real content — see the open_document didOpen
+// fix). Documents missing on disk or outside the new workspace root are
+// skipped; replay failures are logged and never fail the restart.
+// Returns the number of documents successfully re-opened. (issue #3B)
+func (c *LSPClient) replayOpenDocuments(ctx context.Context, snapshot []docMeta, rootDir string) int {
+	replayed := 0
+	for _, meta := range snapshot {
+		if rootDir != "" && !withinRoot(meta.filePath, rootDir) {
+			logging.Log(logging.LevelDebug, "restart replay: skipping document outside new root: "+meta.filePath)
+			continue
+		}
+		data, err := os.ReadFile(meta.filePath)
+		if err != nil {
+			logging.Log(logging.LevelDebug, "restart replay: skipping unreadable document "+meta.filePath+": "+err.Error())
+			continue
+		}
+		uri := "file://" + meta.filePath
+		if err := c.OpenDocument(ctx, uri, string(data), meta.languageID); err != nil {
+			logging.Log(logging.LevelDebug, "restart replay: didOpen failed for "+meta.filePath+": "+err.Error())
+			continue
+		}
+		replayed++
+	}
+	return replayed
+}
+
+// withinRoot reports whether path is inside rootDir (lexical check).
+func withinRoot(path, rootDir string) bool {
+	rel, err := filepath.Rel(rootDir, path)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (!strings.HasPrefix(rel, "..") && !filepath.IsAbs(rel))
 }
 
 // OpenDocument sends textDocument/didOpen or didChange if already open.
@@ -2663,6 +2725,14 @@ func mergeRegisteredCapability(existing any, capKey string, opts json.RawMessage
 		return m
 	}
 	return true
+}
+
+// HasCapability reports whether the server declared the given capability
+// (statically in initialize or via client/registerCapability). Exported so
+// tool handlers can distinguish "empty result" from "feature unavailable"
+// without reaching into the capability internals. (issue #42)
+func (c *LSPClient) HasCapability(key string) bool {
+	return c.hasCapability(key)
 }
 
 func (c *LSPClient) hasCapability(key string) bool {
