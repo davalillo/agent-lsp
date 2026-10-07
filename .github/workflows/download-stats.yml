@@ -25,11 +25,18 @@ jobs:
           # GITHUB_TOKEN cannot push there. The generated assets are published to
           # the unprotected 'badges' branch (no ruleset bypass needed); the README
           # downloads badge points at assets/downloads-badge.json on that branch.
-          git fetch origin badges:refs/remotes/origin/badges
-          git worktree add /tmp/badges origin/badges
-          # Seed the high-water-mark cache from the badges branch (the source of
-          # truth) so the script never regresses totals on a transient API miss.
-          cp /tmp/badges/assets/download-stats.cache assets/download-stats.cache
+          if git ls-remote --exit-code --heads origin badges >/dev/null 2>&1; then
+            git fetch origin badges:refs/remotes/origin/badges
+            git worktree add /tmp/badges origin/badges
+            # Seed the high-water-mark cache from the badges branch (the source of
+            # truth) so the script never regresses totals on a transient API miss.
+            cp /tmp/badges/assets/download-stats.cache assets/download-stats.cache
+          else
+            # First run ever: bootstrap the badges branch as an orphan so the
+            # publish step has a worktree to commit into.
+            git worktree add --orphan -b badges /tmp/badges
+            mkdir -p /tmp/badges/assets
+          fi
 
       - name: Generate download stats
         run: bash scripts/download-stats.sh
