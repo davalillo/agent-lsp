@@ -179,8 +179,13 @@ type LSPClient struct {
 
 	// daemon mode fields
 	isDaemon   bool        // true if connected to a daemon broker (not a direct subprocess)
-	daemonInfo *DaemonInfo // metadata about the connected daemon
+	daemonInfo *DaemonInfo // metadata about the connected daemon; guarded by daemonInfoMu
 	socketConn net.Conn    // socket connection (Unix for daemon, TCP for passive; nil for subprocess)
+
+	// daemonInfoMu guards daemonInfo. daemonReadinessError refreshes the
+	// metadata from disk and is now called concurrently by every read tool,
+	// so the pointer must only be read or replaced while holding this lock.
+	daemonInfoMu sync.RWMutex
 
 	// passive mode: connected to an externally-managed language server via TCP
 	isPassive bool
@@ -393,9 +398,23 @@ func (c *LSPClient) IsDaemon() bool {
 	return c.isDaemon
 }
 
-// DaemonInfo returns the daemon metadata, or nil if not in daemon mode.
+// GetDaemonInfo returns the daemon metadata, or nil if not in daemon mode.
 func (c *LSPClient) GetDaemonInfo() *DaemonInfo {
+	return c.getDaemonInfo()
+}
+
+// getDaemonInfo returns the cached daemon metadata under the read lock.
+func (c *LSPClient) getDaemonInfo() *DaemonInfo {
+	c.daemonInfoMu.RLock()
+	defer c.daemonInfoMu.RUnlock()
 	return c.daemonInfo
+}
+
+// setDaemonInfo replaces the cached daemon metadata under the write lock.
+func (c *LSPClient) setDaemonInfo(info *DaemonInfo) {
+	c.daemonInfoMu.Lock()
+	c.daemonInfo = info
+	c.daemonInfoMu.Unlock()
 }
 
 // start spawns the subprocess and begins reading responses.
@@ -913,20 +932,67 @@ func (c *LSPClient) probeOnce(ctx context.Context) {
 //
 // The fallback wait is capped so a silent server cannot stall a tool call
 // indefinitely.
-func (c *LSPClient) ensureWorkspaceReady(ctx context.Context) {
+//
+// For daemon-owned workspaces it returns a guidance error while the daemon
+// reports the workspace as still being indexed (see daemonReadinessError).
+func (c *LSPClient) ensureWorkspaceReady(ctx context.Context) error {
 	if c.workspaceLoaded.Load() {
-		return
+		return nil
+	}
+	if err := c.daemonReadinessError(); err != nil {
+		return err
+	}
+	// The gate may have just adopted the broker's readiness (which sets
+	// workspaceLoaded). Re-check before falling through to the progress wait:
+	// an active $/progress token can otherwise block this call for up to 60s
+	// even though the broker already declared the workspace ready.
+	if c.workspaceLoaded.Load() {
+		return nil
 	}
 	if c.HasActiveProgress() || c.hasSeenProgress.Load() {
 		// Progress-based server: wait for tokens to drain.
 		c.waitForWorkspaceReady(ctx)
 		if c.workspaceLoaded.Load() {
-			return
+			return nil
 		}
 	}
 	// No usable $/progress signal (or it never drained): block on the
 	// event-driven readiness channel with liveness probing.
 	_ = c.AwaitReady(ctx, 120*time.Second)
+	return nil
+}
+
+// daemonReadinessError reports whether a daemon-owned workspace is ready for
+// queries. It refreshes the daemon state from disk — the broker rewrites
+// daemon.json with ready=true once its indexing wait completes — and marks the
+// client ready on success. Returns nil for non-daemon clients and for ready
+// daemons; otherwise a guidance error the caller can surface to the agent.
+func (c *LSPClient) daemonReadinessError() error {
+	if !c.isDaemon {
+		return nil
+	}
+	info := c.getDaemonInfo()
+	if info == nil {
+		return nil
+	}
+	if !info.Ready {
+		if refreshed, _ := RefreshDaemonInfo(info.RootDir, info.LanguageID); refreshed != nil {
+			c.setDaemonInfo(refreshed)
+			// Re-load the latest cached value for the Ready check below
+			// rather than trusting a possibly stale local snapshot.
+			info = c.getDaemonInfo()
+		}
+	}
+	if info.Ready {
+		// Adopt the broker's readiness into all three client-side signals so
+		// subsequent calls take their fast paths.
+		c.workspaceLoaded.Store(true)
+		c.warmup.MarkReady()
+		c.markReady()
+		return nil
+	}
+	elapsed := time.Since(info.StartTime).Round(time.Second)
+	return fmt.Errorf("workspace is still being indexed by the daemon (started %s ago). Tools will return complete results once indexing finishes. Check status with get_daemon_status", elapsed)
 }
 
 // WaitForWorkspaceReadyTimeout blocks until all active $/progress tokens are
@@ -2022,7 +2088,9 @@ func (c *LSPClient) GetInfoOnLocation(ctx context.Context, uri string, pos types
 		logging.Log(logging.LevelDebug, "server does not support hover")
 		return "", nil
 	}
-	c.ensureWorkspaceReady(ctx)
+	if err := c.ensureWorkspaceReady(ctx); err != nil {
+		return "", err
+	}
 	result, err := c.sendRequest(ctx, "textDocument/hover", map[string]any{
 		"textDocument": map[string]any{"uri": uri},
 		"position":     pos,
@@ -2075,7 +2143,9 @@ func (c *LSPClient) GetCompletion(ctx context.Context, uri string, pos types.Pos
 		logging.Log(logging.LevelDebug, "server does not support completion")
 		return types.CompletionList{Items: []types.CompletionItem{}}, nil
 	}
-	c.ensureWorkspaceReady(ctx)
+	if err := c.ensureWorkspaceReady(ctx); err != nil {
+		return types.CompletionList{}, err
+	}
 	result, err := c.sendRequest(ctx, "textDocument/completion", map[string]any{
 		"textDocument": map[string]any{"uri": uri},
 		"position":     pos,
@@ -2094,7 +2164,9 @@ func (c *LSPClient) GetCodeActions(ctx context.Context, uri string, rng types.Ra
 		logging.Log(logging.LevelDebug, "server does not support codeAction")
 		return []types.CodeAction{}, nil
 	}
-	c.ensureWorkspaceReady(ctx)
+	if err := c.ensureWorkspaceReady(ctx); err != nil {
+		return nil, err
+	}
 	// Retrieve diagnostics that overlap the requested range.
 	c.diagMu.RLock()
 	allDiags := c.diags[uri]
@@ -2131,7 +2203,9 @@ func (c *LSPClient) GetDefinition(ctx context.Context, uri string, pos types.Pos
 		logging.Log(logging.LevelDebug, "server does not support definition")
 		return []types.Location{}, nil
 	}
-	c.ensureWorkspaceReady(ctx)
+	if err := c.ensureWorkspaceReady(ctx); err != nil {
+		return nil, err
+	}
 	result, err := c.sendRequest(ctx, "textDocument/definition", map[string]any{
 		"textDocument": map[string]any{"uri": uri},
 		"position":     pos,
@@ -2148,7 +2222,9 @@ func (c *LSPClient) GetTypeDefinition(ctx context.Context, uri string, pos types
 		logging.Log(logging.LevelDebug, "server does not support typeDefinition")
 		return []types.Location{}, nil
 	}
-	c.ensureWorkspaceReady(ctx)
+	if err := c.ensureWorkspaceReady(ctx); err != nil {
+		return nil, err
+	}
 	result, err := c.sendRequest(ctx, "textDocument/typeDefinition", map[string]any{
 		"textDocument": map[string]any{"uri": uri},
 		"position":     pos,
@@ -2165,7 +2241,9 @@ func (c *LSPClient) GetImplementation(ctx context.Context, uri string, pos types
 		logging.Log(logging.LevelDebug, "server does not support implementation")
 		return []types.Location{}, nil
 	}
-	c.ensureWorkspaceReady(ctx)
+	if err := c.ensureWorkspaceReady(ctx); err != nil {
+		return nil, err
+	}
 	result, err := c.sendRequest(ctx, "textDocument/implementation", map[string]any{
 		"textDocument": map[string]any{"uri": uri},
 		"position":     pos,
@@ -2182,7 +2260,9 @@ func (c *LSPClient) GetDeclaration(ctx context.Context, uri string, pos types.Po
 		logging.Log(logging.LevelDebug, "server does not support declaration")
 		return []types.Location{}, nil
 	}
-	c.ensureWorkspaceReady(ctx)
+	if err := c.ensureWorkspaceReady(ctx); err != nil {
+		return nil, err
+	}
 	result, err := c.sendRequest(ctx, "textDocument/declaration", map[string]any{
 		"textDocument": map[string]any{"uri": uri},
 		"position":     pos,
@@ -2246,7 +2326,9 @@ func (c *LSPClient) GetDocumentSymbols(ctx context.Context, uri string) ([]types
 		logging.Log(logging.LevelDebug, "server does not support documentSymbol")
 		return []types.DocumentSymbol{}, nil
 	}
-	c.ensureWorkspaceReady(ctx)
+	if err := c.ensureWorkspaceReady(ctx); err != nil {
+		return nil, err
+	}
 	result, err := c.sendRequest(ctx, "textDocument/documentSymbol", map[string]any{
 		"textDocument": map[string]any{"uri": uri},
 	})
@@ -2265,7 +2347,9 @@ func (c *LSPClient) GetWorkspaceSymbols(ctx context.Context, query string) ([]ty
 		logging.Log(logging.LevelDebug, "server does not support workspaceSymbol")
 		return []types.SymbolInformation{}, nil
 	}
-	c.ensureWorkspaceReady(ctx)
+	if err := c.ensureWorkspaceReady(ctx); err != nil {
+		return nil, err
+	}
 	result, err := c.sendRequest(ctx, "workspace/symbol", map[string]any{
 		"query": query,
 	})
@@ -2289,7 +2373,9 @@ func (c *LSPClient) PrepareCallHierarchy(ctx context.Context, uri string, pos ty
 		logging.Log(logging.LevelDebug, "server does not support callHierarchy")
 		return []types.CallHierarchyItem{}, nil
 	}
-	c.ensureWorkspaceReady(ctx)
+	if err := c.ensureWorkspaceReady(ctx); err != nil {
+		return nil, err
+	}
 	result, err := c.sendRequest(ctx, "textDocument/prepareCallHierarchy", map[string]any{
 		"textDocument": map[string]any{"uri": uri},
 		"position":     pos,
@@ -2351,7 +2437,9 @@ func (c *LSPClient) GetInlayHints(ctx context.Context, uri string, rng types.Ran
 		logging.Log(logging.LevelDebug, "server does not support inlayHint")
 		return []types.InlayHint{}, nil
 	}
-	c.ensureWorkspaceReady(ctx)
+	if err := c.ensureWorkspaceReady(ctx); err != nil {
+		return nil, err
+	}
 	result, err := c.sendRequest(ctx, "textDocument/inlayHint", map[string]any{
 		"textDocument": map[string]any{"uri": uri},
 		"range":        rng,
@@ -2376,7 +2464,9 @@ func (c *LSPClient) PrepareTypeHierarchy(ctx context.Context, uri string, pos ty
 		logging.Log(logging.LevelDebug, "server does not support typeHierarchy")
 		return []types.TypeHierarchyItem{}, nil
 	}
-	c.ensureWorkspaceReady(ctx)
+	if err := c.ensureWorkspaceReady(ctx); err != nil {
+		return nil, err
+	}
 	result, err := c.sendRequest(ctx, "textDocument/prepareTypeHierarchy", map[string]any{
 		"textDocument": map[string]any{"uri": uri},
 		"position":     pos,
@@ -2436,7 +2526,9 @@ func (c *LSPClient) GetSignatureHelp(ctx context.Context, uri string, pos types.
 		logging.Log(logging.LevelDebug, "server does not support signatureHelp")
 		return nil, nil
 	}
-	c.ensureWorkspaceReady(ctx)
+	if err := c.ensureWorkspaceReady(ctx); err != nil {
+		return nil, err
+	}
 	result, err := c.sendRequest(ctx, "textDocument/signatureHelp", map[string]any{
 		"textDocument": map[string]any{"uri": uri},
 		"position":     pos,
@@ -3119,7 +3211,9 @@ func (c *LSPClient) GetDocumentHighlights(ctx context.Context, uri string, pos t
 		logging.Log(logging.LevelDebug, "server does not support documentHighlight")
 		return []types.DocumentHighlight{}, nil
 	}
-	c.ensureWorkspaceReady(ctx)
+	if err := c.ensureWorkspaceReady(ctx); err != nil {
+		return nil, err
+	}
 	result, err := c.sendRequest(ctx, "textDocument/documentHighlight", map[string]any{
 		"textDocument": map[string]any{"uri": uri},
 		"position":     pos,
@@ -3336,7 +3430,9 @@ func (c *LSPClient) GetSemanticTokens(ctx context.Context, uri string, rng types
 		logging.Log(logging.LevelDebug, "server does not support semanticTokens")
 		return []types.SemanticToken{}, nil
 	}
-	c.ensureWorkspaceReady(ctx)
+	if err := c.ensureWorkspaceReady(ctx); err != nil {
+		return nil, err
+	}
 
 	c.legendMu.RLock()
 	tokenTypes := make([]string, len(c.legendTypes))
